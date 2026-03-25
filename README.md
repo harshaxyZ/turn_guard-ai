@@ -145,12 +145,6 @@ dashboard.py                ← Streamlit dashboard
 
 ## 👥 Team
 
-Built at **HackSETU 2025** — 48-hour hackathon
+Built at **HackSETU 2025** 
 
----
 
-## 📜 Three Lines That Win
-
-1. **"Predictive, not reactive — we act before danger arrives."**
-2. **"3-second lookahead, 70% threshold, HOLD or ALLOW."**
-3. **"Existing CCTV, no new hardware, ₹6,000 per junction."**
