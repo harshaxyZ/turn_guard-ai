@@ -77,6 +77,22 @@ python safeturn_phase1.py --mock
 
 ---
 
+## 🚨 Extended Features (Post-Accident Response)
+
+When an accident IS detected (overlap + speed drop):
+
+| Feature | What Happens |
+|---------|-------------|
+| 🚧 Accident Detection | Bounding box overlap + speed drop = collision |
+| 🔴 Traffic Control | ALL SIGNALS RED displayed immediately |
+| ⚡ Severity Estimation | HIGH / MEDIUM / LOW based on speed + overlap |
+| 🚑 Ambulance Alert | "Ambulance Alert Triggered" displayed |
+| 👥 Crowd Density | Pedestrian count → LOW / MEDIUM / HIGH |
+
+Press **A** during the demo to simulate an accident!
+
+---
+
 ## ⚙️ How the Prediction Works
 
 1. **Detect** objects using YOLOv8 nano (optimized for CPU)
@@ -97,14 +113,20 @@ python safeturn_phase1.py --mock
 ## 🏗️ Architecture
 
 ```
-safeturn_phase1.py          ← Complete standalone system
+safeturn_final.py           ← COMPLETE SYSTEM (recommended for demo)
 ├── CentroidTracker         ← Object tracking (centroid matching)
 ├── predict_position()      ← Linear extrapolation from velocity
 ├── compute_conflict_probability()  ← Multi-factor risk scoring
 ├── get_decision()          ← Threshold-based HOLD/CAUTION/ALLOW
-├── draw_overlay()          ← Full OpenCV visualization
+├── AccidentDetector        ← Post-accident detection + severity
+├── get_crowd_density()     ← Pedestrian count + density level
+├── draw_overlay()          ← Full OpenCV visualization + accident alerts
 ├── MockDetectionGenerator  ← Synthetic demo mode
-└── run_yolo_detection()    ← YOLOv8 wrapper with class filtering
+└── run_yolo()              ← YOLOv8 wrapper with class filtering
+
+safeturn_phase1.py          ← Core-only standalone
+safeturn_phase2.py          ← Enhanced tracking (DeepSORT)
+dashboard.py                ← Streamlit dashboard
 ```
 
 ---
