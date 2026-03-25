@@ -75,17 +75,23 @@ TRAIL_LENGTH = 20          # Trail history length
 LOOKAHEAD_SECONDS = 3.0    # Predict this far ahead
 HISTORY_FOR_VELOCITY = 5   # Frames used for velocity calc
 
-# Conflict thresholds
-CONFLICT_CLOSE_PX = 80     # Below this = high conflict
-CONFLICT_FAR_PX = 250      # Above this = no conflict
-HOLD_THRESHOLD = 0.70      # > 70% → 🔴 HOLD
-CAUTION_THRESHOLD = 0.40   # > 40% → 🟡 CAUTION
+# Conflict thresholds (tuned for real CCTV — objects are larger)
+CONFLICT_CLOSE_PX = 30     # Below this = high conflict (was 80 — too big for real video)
+CONFLICT_FAR_PX = 200      # Above this = no conflict
+SAFE_DISTANCE_PX = 120     # NEW: If current distance > this → skip pair entirely
+HOLD_THRESHOLD = 0.75      # > 75% → 🔴 HOLD (raised from 70%)
+CAUTION_THRESHOLD = 0.50   # > 50% → 🟡 CAUTION (raised from 40%)
+
+# Stability filter — prevents flickering decisions
+HOLD_STABILITY_FRAMES = 3  # HOLD only fires after 3 consecutive high frames
+DECISION_COOLDOWN_FRAMES = 15  # Min frames between decision changes
 
 # ═══ EXTENDED FEATURE CONFIG ═══
-# Accident detection
-ACCIDENT_OVERLAP_PX = 40   # Bbox overlap threshold for collision
-ACCIDENT_SPEED_DROP = 0.5  # Speed must drop by 50% to confirm accident
-ACCIDENT_COOLDOWN = 90     # Frames to keep showing accident alert
+# Accident detection (tightened)
+ACCIDENT_OVERLAP_AREA = 800  # Bbox overlap must be > this many px² (was any overlap)
+ACCIDENT_SPEED_DROP = 0.3    # Speed must drop by 70% to confirm (was 50%)
+ACCIDENT_MIN_PREV_SPEED = 5.0  # Object must have been moving at least this fast
+ACCIDENT_COOLDOWN = 120      # Frames to keep showing accident alert
 
 # Crowd density
 CROWD_HIGH_THRESHOLD = 5   # >= this many people = HIGH density
@@ -254,48 +260,98 @@ def predict_position(history, fps):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CONFLICT ENGINE — Collision probability for ped-vehicle pairs
+# CONFLICT ENGINE — IMPROVED with direction check + TTC
+# ═══════════════════════════════════════════════════════════════════
+# Fixes applied:
+#   1. Direction check — ignore objects moving AWAY from each other
+#   2. Time-to-collision gate — only flag if collision within 3s
+#   3. Tighter distance thresholds for real CCTV footage
+#   4. Safe zone: skip pairs that are far apart currently
 # ═══════════════════════════════════════════════════════════════════
 
-def compute_conflict_probability(ped_pred, ped_vel, veh_pred, veh_vel):
+def compute_conflict_probability(ped_pred, ped_vel, veh_pred, veh_vel,
+                                 ped_pos=None, veh_pos=None):
     """
-    3-factor conflict probability:
-      60% distance at T+3s
-      25% closing speed
-      15% trajectory convergence
+    Improved conflict probability with false-positive reduction.
+
+    Args:
+        ped_pred/veh_pred: predicted positions at T+3s
+        ped_vel/veh_vel: velocity vectors (px/frame)
+        ped_pos/veh_pos: CURRENT positions (for direction check)
     """
     if ped_pred is None or veh_pred is None:
         return 0.0
 
-    # Distance factor
-    dist = math.dist(ped_pred, veh_pred)
-    if dist < CONFLICT_CLOSE_PX:
+    # ── FIX 1: Safe zone — skip if current positions are very far apart ──
+    if ped_pos and veh_pos:
+        current_dist = math.dist(ped_pos, veh_pos)
+        if current_dist > SAFE_DISTANCE_PX * 3:  # Way too far to matter
+            return 0.0
+
+    # ── FIX 2: Direction check — are they moving TOWARD each other? ──
+    if ped_vel and veh_vel and ped_pos and veh_pos:
+        # Vector from pedestrian to vehicle
+        dx = veh_pos[0] - ped_pos[0]
+        dy = veh_pos[1] - ped_pos[1]
+        sep_dist = math.sqrt(dx*dx + dy*dy)
+
+        if sep_dist > 1.0:
+            # Normalize separation vector
+            sep_x, sep_y = dx / sep_dist, dy / sep_dist
+
+            # Project velocities onto separation axis
+            # Positive = moving toward each other
+            ped_toward = ped_vel[0]*sep_x + ped_vel[1]*sep_y
+            veh_toward = -(veh_vel[0]*sep_x + veh_vel[1]*sep_y)
+
+            closing_rate = ped_toward + veh_toward
+
+            # If objects are moving APART or PARALLEL → very low risk
+            if closing_rate < 0.3:  # Not converging meaningfully
+                return 0.0
+
+    # ── FIX 3: Time-to-collision estimate ──
+    if ped_vel and veh_vel and ped_pos and veh_pos:
+        # Relative velocity
+        rel_vx = veh_vel[0] - ped_vel[0]
+        rel_vy = veh_vel[1] - ped_vel[1]
+        rel_speed = math.sqrt(rel_vx**2 + rel_vy**2)
+
+        if rel_speed > 0.5:
+            # Time to close the current gap
+            ttc = current_dist / (rel_speed * max(10, 10))  # Rough TTC in seconds
+            if ttc > LOOKAHEAD_SECONDS * 2:  # Won't collide in our window
+                return 0.0
+
+    # ── Distance factor (50% weight) ──
+    pred_dist = math.dist(ped_pred, veh_pred)
+    if pred_dist < CONFLICT_CLOSE_PX:
         df = 1.0
-    elif dist > CONFLICT_FAR_PX:
+    elif pred_dist > CONFLICT_FAR_PX:
         df = 0.0
     else:
-        df = 1.0 - (dist - CONFLICT_CLOSE_PX) / (CONFLICT_FAR_PX - CONFLICT_CLOSE_PX)
+        df = 1.0 - (pred_dist - CONFLICT_CLOSE_PX) / (CONFLICT_FAR_PX - CONFLICT_CLOSE_PX)
 
-    # Speed factor
+    # ── Closing speed factor (30% weight) ──
     if ped_vel and veh_vel:
         rv = math.sqrt((veh_vel[0]-ped_vel[0])**2 + (veh_vel[1]-ped_vel[1])**2)
-        sf = min(rv / 8.0, 1.0)
+        sf = min(rv / 10.0, 1.0)  # Raised denominator for less sensitivity
     else:
-        sf = 0.5
+        sf = 0.3  # Lowered default (was 0.5)
 
-    # Convergence factor
+    # ── Convergence factor (20% weight) ──
     if ped_vel and veh_vel:
         ps = math.sqrt(ped_vel[0]**2 + ped_vel[1]**2)
         vs = math.sqrt(veh_vel[0]**2 + veh_vel[1]**2)
-        if ps > 0.1 and vs > 0.1:
+        if ps > 0.3 and vs > 0.3:  # Need meaningful motion (raised from 0.1)
             dot = (ped_vel[0]/ps * veh_vel[0]/vs + ped_vel[1]/ps * veh_vel[1]/vs)
             cf = (1.0 - dot) / 2.0
         else:
-            cf = 0.5
+            cf = 0.2  # Slow/stationary = low convergence risk
     else:
-        cf = 0.5
+        cf = 0.2
 
-    prob = 0.60*df + 0.25*sf + 0.15*cf
+    prob = 0.50*df + 0.30*sf + 0.20*cf
     return round(min(max(prob, 0.0), 1.0), 3)
 
 
@@ -352,15 +408,15 @@ class AccidentDetector:
 
     def _estimate_severity(self, speed1, speed2, overlap_area):
         """
-        Simple severity estimation:
-        - HIGH: fast objects + large overlap
-        - MEDIUM: moderate
-        - LOW: slow objects or small overlap
+        Severity estimation (tightened thresholds):
+        - HIGH: fast objects + large overlap → triggers ambulance
+        - MEDIUM: moderate → warning only
+        - LOW: minor → no ambulance
         """
         combined_speed = speed1 + speed2
-        if combined_speed > 10 and overlap_area > 500:
+        if combined_speed > 15 and overlap_area > 1500:  # Raised thresholds
             return "HIGH"
-        elif combined_speed > 5 or overlap_area > 200:
+        elif combined_speed > 8 and overlap_area > 800:  # Tightened
             return "MEDIUM"
         else:
             return "LOW"
@@ -397,27 +453,28 @@ class AccidentDetector:
                 if cls1 not in VEHICLE_CLASSES and cls2 not in VEHICLE_CLASSES:
                     continue
 
-                # Check overlap
+                # FIX: Only check actual bbox OVERLAP (not just proximity)
                 overlap = self._bbox_overlap(bbox1, bbox2)
-                dist = self._bbox_distance(bbox1, bbox2)
 
-                if overlap > 0 or dist < ACCIDENT_OVERLAP_PX:
-                    # Check speed drop (objects stopped/slowed after collision)
+                # FIX: Require significant overlap area, not just touching
+                if overlap > ACCIDENT_OVERLAP_AREA:
                     speed1 = tracker.speeds.get(id1, 0)
                     speed2 = tracker.speeds.get(id2, 0)
                     prev1 = self.prev_speeds.get(id1, speed1)
                     prev2 = self.prev_speeds.get(id2, speed2)
 
-                    # Speed drop detection: was moving fast, now slow
+                    # FIX: STRICT speed drop — must have been moving fast
+                    # AND must have slowed significantly (impact behavior)
                     speed_dropped = False
-                    if prev1 > 3.0 and speed1 < prev1 * ACCIDENT_SPEED_DROP:
+                    if (prev1 > ACCIDENT_MIN_PREV_SPEED and
+                            speed1 < prev1 * ACCIDENT_SPEED_DROP):
                         speed_dropped = True
-                    if prev2 > 3.0 and speed2 < prev2 * ACCIDENT_SPEED_DROP:
+                    if (prev2 > ACCIDENT_MIN_PREV_SPEED and
+                            speed2 < prev2 * ACCIDENT_SPEED_DROP):
                         speed_dropped = True
 
-                    # Or very close + at least one is moving
-                    if overlap > 100 or (dist < 30 and (speed1 > 2 or speed2 > 2)):
-                        speed_dropped = True
+                    # FIX: REMOVED the distance-only bypass (line 419 was the
+                    # main cause of false accident triggers)
 
                     if speed_dropped and not self.accident_active:
                         # ═══ ACCIDENT DETECTED ═══
@@ -425,7 +482,7 @@ class AccidentDetector:
                         self.accident_frame = frame_count
                         self.cooldown_counter = ACCIDENT_COOLDOWN
                         self.accident_severity = self._estimate_severity(
-                            prev1, prev2, max(overlap, 1))
+                            prev1, prev2, overlap)
                         mid_x = int((bbox1[0]+bbox1[2]+bbox2[0]+bbox2[2]) / 4)
                         mid_y = int((bbox1[1]+bbox1[3]+bbox2[1]+bbox2[3]) / 4)
                         self.accident_location = (mid_x, mid_y)
@@ -713,9 +770,13 @@ def draw_overlay(frame, tracked, predictions, conflicts, decision,
         cv2.putText(frame, f"Severity: {sev}", (w//2-80, banner_y+125),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, sev_color, 2)
 
-        # Ambulance alert
-        cv2.putText(frame, "AMBULANCE ALERT TRIGGERED", (w//2-190, banner_y+155),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, CYAN, 2)
+        # Ambulance alert — FIX: Only for HIGH severity
+        if sev == "HIGH":
+            cv2.putText(frame, "AMBULANCE ALERT TRIGGERED", (w//2-190, banner_y+155),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, CYAN, 2)
+        elif sev == "MEDIUM":
+            cv2.putText(frame, "MONITORING - STANDBY", (w//2-140, banner_y+155),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, YELLOW, 2)
 
         # Accident location marker
         loc = accident_info["location"]
@@ -847,6 +908,10 @@ def main():
     frame_count = 0
     prev_decision = None
 
+    # ═══ STABILITY FILTER state ═══
+    high_risk_streak = 0       # Consecutive frames with prob > HOLD_THRESHOLD
+    decision_cooldown = 0      # Frames remaining before decision can change
+
     print("\n[READY] Q=quit  S=screenshot  A=simulate accident\n")
 
     # ════════════════════════
@@ -883,7 +948,7 @@ def main():
             if h and len(h) >= 2:
                 predictions[oid] = predict_position(h, fps)
 
-        # Conflict Engine
+        # Conflict Engine — FIX: Only pedestrian-vehicle pairs
         peds = [oid for oid, (_,_,c) in tracked.items() if c == 0]
         vehs = [oid for oid, (_,_,c) in tracked.items() if c in VEHICLE_CLASSES]
 
@@ -892,19 +957,38 @@ def main():
         for pid in peds:
             for vid in vehs:
                 if pid in predictions and vid in predictions:
+                    # FIX: Pass current positions for direction check
+                    ped_pos = tracked[pid][0] if pid in tracked else None
+                    veh_pos = tracked[vid][0] if vid in tracked else None
                     prob = compute_conflict_probability(
                         predictions[pid][0], predictions[pid][1],
-                        predictions[vid][0], predictions[vid][1])
+                        predictions[vid][0], predictions[vid][1],
+                        ped_pos, veh_pos)
                     conflicts[(pid, vid)] = prob
                     max_prob = max(max_prob, prob)
 
-        # Decision
-        decision, dec_color = get_decision(max_prob)
-        if decision != prev_decision:
+        # ═══ STABILITY FILTER ═══
+        # HOLD only fires after N consecutive high-risk frames
+        if max_prob > HOLD_THRESHOLD:
+            high_risk_streak += 1
+        else:
+            high_risk_streak = 0
+
+        # Apply stability: downgrade to CAUTION if streak too short
+        stable_prob = max_prob
+        if max_prob > HOLD_THRESHOLD and high_risk_streak < HOLD_STABILITY_FRAMES:
+            stable_prob = CAUTION_THRESHOLD + 0.05  # Show as CAUTION until confirmed
+
+        # Decision with cooldown
+        decision, dec_color = get_decision(stable_prob)
+        if decision_cooldown > 0:
+            decision_cooldown -= 1
+        if decision != prev_decision and decision_cooldown <= 0:
             if decision == "HOLD": stats["holds"] += 1
             elif decision == "CAUTION": stats["cautions"] += 1
             else: stats["allows"] += 1
             prev_decision = decision
+            decision_cooldown = DECISION_COOLDOWN_FRAMES
 
         # ═══ EXTENDED: Accident Detection ═══
         accident_info = accident_detector.update(tracked, tracker, frame_count)
